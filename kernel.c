@@ -114,12 +114,126 @@ void kernel_entry(void) {
     );
 }
 
+long getchar(void) {
+    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+    return ret.error;
+}
+
+__attribute__((naked)) void switch_context(uint32_t *prev_sp,
+    uint32_t *next_sp) {
+    __asm__ __volatile__(
+    // Save callee-saved registers onto the current process's stack.
+    "addi sp, sp, -13 * 4\n" // Allocate stack space for 13 4-byte registers
+    "sw ra,  0  * 4(sp)\n"   // Save callee-saved registers only
+    "sw s0,  1  * 4(sp)\n"
+    "sw s1,  2  * 4(sp)\n"
+    "sw s2,  3  * 4(sp)\n"
+    "sw s3,  4  * 4(sp)\n"
+    "sw s4,  5  * 4(sp)\n"
+    "sw s5,  6  * 4(sp)\n"
+    "sw s6,  7  * 4(sp)\n"
+    "sw s7,  8  * 4(sp)\n"
+    "sw s8,  9  * 4(sp)\n"
+    "sw s9,  10 * 4(sp)\n"
+    "sw s10, 11 * 4(sp)\n"
+    "sw s11, 12 * 4(sp)\n"
+
+    // Switch the stack pointer.
+    "sw sp, (a0)\n"         // *prev_sp = sp;
+    "lw sp, (a1)\n"         // Switch stack pointer (sp) here
+
+    // Restore callee-saved registers from the next process's stack.
+    "lw ra,  0  * 4(sp)\n"  // Restore callee-saved registers only
+    "lw s0,  1  * 4(sp)\n"
+    "lw s1,  2  * 4(sp)\n"
+    "lw s2,  3  * 4(sp)\n"
+    "lw s3,  4  * 4(sp)\n"
+    "lw s4,  5  * 4(sp)\n"
+    "lw s5,  6  * 4(sp)\n"
+    "lw s6,  7  * 4(sp)\n"
+    "lw s7,  8  * 4(sp)\n"
+    "lw s8,  9  * 4(sp)\n"
+    "lw s9,  10 * 4(sp)\n"
+    "lw s10, 11 * 4(sp)\n"
+    "lw s11, 12 * 4(sp)\n"
+    "addi sp, sp, 13 * 4\n"  // We've popped 13 4-byte registers from the stack
+    "ret\n"
+    );
+}
+
+struct process *current_proc; // Currently running process
+struct process *idle_proc;    // Idle process
+
+void yield(void) {
+    // Search for a runnable process
+    struct process *next = idle_proc;
+    for (int i = 0; i < PROCS_MAX; i++) {
+        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+            next = proc;
+            break;
+        }
+    }
+
+    // If there's no runnable process other than the current one, return and continue processing
+    if (next == current_proc)
+        return;
+
+    __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
+        "csrw sscratch, %[sscratch]\n"
+        :
+         // Don't forget the trailing comma!
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+        [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
+    // Context switch
+    struct process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev->sp, &next->sp);
+}
+
+
+void handle_syscall(struct trap_frame *f) {
+    switch (f->a3) {
+        case SYS_PUTCHAR:
+            putchar(f->a0);
+            break;
+        case SYS_GETCHAR:
+            while (1) {
+                long ch = getchar();
+                if (ch >= 0) {
+                    f->a0 = ch;
+                    break;
+                }
+
+                yield();
+            }
+            break;
+        case SYS_EXIT:
+            printf("process %d exited\n", current_proc->pid);
+            current_proc->state = PROC_EXITED;
+            yield();
+            PANIC("unreachable");
+        default:
+            PANIC("unexpected syscall a3=%x\n", f->a3);
+    }
+}
+
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
     uint32_t user_pc = READ_CSR(sepc);
-
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    if (scause == SCAUSE_ECALL) {
+        handle_syscall(f);
+        user_pc += 4;
+    } else {
+        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
+    }
+    WRITE_CSR(sepc, user_pc);
 }
 
 paddr_t alloc_pages(uint32_t n) {
@@ -132,48 +246,6 @@ paddr_t alloc_pages(uint32_t n) {
 
     memset((void *) paddr, 0, n * PAGE_SIZE);
     return paddr;
-}
-
-__attribute__((naked)) void switch_context(uint32_t *prev_sp,
-                                           uint32_t *next_sp) {
-    __asm__ __volatile__(
-        // Save callee-saved registers onto the current process's stack.
-        "addi sp, sp, -13 * 4\n" // Allocate stack space for 13 4-byte registers
-        "sw ra,  0  * 4(sp)\n"   // Save callee-saved registers only
-        "sw s0,  1  * 4(sp)\n"
-        "sw s1,  2  * 4(sp)\n"
-        "sw s2,  3  * 4(sp)\n"
-        "sw s3,  4  * 4(sp)\n"
-        "sw s4,  5  * 4(sp)\n"
-        "sw s5,  6  * 4(sp)\n"
-        "sw s6,  7  * 4(sp)\n"
-        "sw s7,  8  * 4(sp)\n"
-        "sw s8,  9  * 4(sp)\n"
-        "sw s9,  10 * 4(sp)\n"
-        "sw s10, 11 * 4(sp)\n"
-        "sw s11, 12 * 4(sp)\n"
-
-        // Switch the stack pointer.
-        "sw sp, (a0)\n"         // *prev_sp = sp;
-        "lw sp, (a1)\n"         // Switch stack pointer (sp) here
-
-        // Restore callee-saved registers from the next process's stack.
-        "lw ra,  0  * 4(sp)\n"  // Restore callee-saved registers only
-        "lw s0,  1  * 4(sp)\n"
-        "lw s1,  2  * 4(sp)\n"
-        "lw s2,  3  * 4(sp)\n"
-        "lw s3,  4  * 4(sp)\n"
-        "lw s4,  5  * 4(sp)\n"
-        "lw s5,  6  * 4(sp)\n"
-        "lw s6,  7  * 4(sp)\n"
-        "lw s7,  8  * 4(sp)\n"
-        "lw s8,  9  * 4(sp)\n"
-        "lw s9,  10 * 4(sp)\n"
-        "lw s10, 11 * 4(sp)\n"
-        "lw s11, 12 * 4(sp)\n"
-        "addi sp, sp, 13 * 4\n"  // We've popped 13 4-byte registers from the stack
-        "ret\n"
-    );
 }
 
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
@@ -273,40 +345,6 @@ void delay(void) {
         __asm__ __volatile__("nop"); // do nothing
 }
 
-struct process *current_proc; // Currently running process
-struct process *idle_proc;    // Idle process
-
-void yield(void) {
-    // Search for a runnable process
-    struct process *next = idle_proc;
-    for (int i = 0; i < PROCS_MAX; i++) {
-        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
-        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
-            next = proc;
-            break;
-        }
-    }
-
-    // If there's no runnable process other than the current one, return and continue processing
-    if (next == current_proc)
-        return;
-
-    __asm__ __volatile__(
-        "sfence.vma\n"
-        "csrw satp, %[satp]\n"
-        "sfence.vma\n"
-        "csrw sscratch, %[sscratch]\n"
-        :
-         // Don't forget the trailing comma!
-        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
-        [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
-    );
-
-    // Context switch
-    struct process *prev = current_proc;
-    current_proc = next;
-    switch_context(&prev->sp, &next->sp);
-}
 
 struct process *proc_a;
 struct process *proc_b;
@@ -326,8 +364,6 @@ void proc_b_entry(void) {
         yield();
     }
 }
-
-
 
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
